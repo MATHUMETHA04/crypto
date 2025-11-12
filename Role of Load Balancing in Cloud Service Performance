@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""
+lb_simulation.py
+
+Simulates load balancing strategies and measures cloud service performance.
+
+Features:
+- Simulated backend servers with configurable processing time distributions
+- Four LB strategies:
+    * round_robin
+    * least_connections
+    * random
+    * weighted_round_robin
+- Traffic generator with poisson arrival (approx) and configurable request rate
+- Measures: request latency (queue + service), throughput, per-server utilization, dropped requests (if queue full)
+- Prints a summary table and per-second time series to STDOUT and to CSV files
+- No external dependencies; pure asyncio + standard library
+
+Usage:
+    python3 lb_simulation.py
+
+Tune parameters in the CONFIG section below.
+"""
+
+import asyncio
+import random
+import time
+import statistics
+import csv
+from collections import deque, defaultdict
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+NUM_SERVERS = 5
+SIM_DURATION = 60            # seconds to simulate
+REQUEST_RATE = 50            # average requests per second (incoming)
+SERVICE_TIME_MEAN = 0.08     # average service time (sec) per request
+SERVICE_TIME_STD = 0.03      # sd of service time (clipped)
+MAX_QUEUE_PER_SERVER = 50    # max queued requests per server (requests beyond are dropped)
+REPORT_INTERVAL = 1.0        # seconds - collect metrics per second
+
+LB_STRATEGY = "least_connections"  # choose: round_robin, least_connections, random, weighted_round_robin
+
+# For weighted r.r., specify weights per server (length must be NUM_SERVERS)
+SERVER_WEIGHTS = [1, 1, 2, 1, 1]  # higher means more share
+
+# Seed RNG for reproducibility
+RANDOM_SEED = 42
+
+# ----------------------------
+# Instrumentation structures
+# ----------------------------
+random.seed(RANDOM_SEED)
+
+class Metrics:
+    def __init__(self):
+        self.total_requests = 0
+        self.completed_requests = 0
+        self.dropped_requests = 0
+        self.latencies = []          # completed request latencies
+        self.per_second = defaultdict(lambda: {'arrivals':0,'completed':0,'dropped':0,'avg_latency':None})
+        self.server_hits = defaultdict(int)
+
+metrics = Metrics()
+
+# ----------------------------
+# Simulated Backend Server
+# ----------------------------
+class BackendServer:
+    def __init__(self, id, service_mean, service_std, max_queue):
+        self.id = id
+        self.service_mean = service_mean
+        self.service_std = service_std
+        self.max_queue = max_queue
+        self.queue = asyncio.Queue(maxsize=max_queue)
+        self.current_processing = 0   # number currently being processed (0 or 1 for single-worker model)
+        self.total_processed = 0
+        self._running = False
+
+    def sample_service_time(self):
+        t = random.gauss(self.service_mean, self.service_std)
+        if t < 0.001:
+            t = 0.001
+        return t
+
+    async def start(self):
+        """Backend worker loop - pulls requests from its queue and services them."""
+        self._running = True
+        while self._running:
+            req = await self.queue.get()
+            self.current_processing += 1
+            # service time
+            await asyncio.sleep(self.sample_service_time())
+            self.current_processing -= 1
+            self.total_processed += 1
+            # signal completion by calling the stored callback
+            try:
+                req['complete_callback'](self.id, req)
+            except Exception:
+                pass
+            self.queue.task_done()
+
+    def stop(self):
+        self._running = False
+
+    def queue_len(self):
+        # count queued + currently processing
+        return self.queue.qsize() + self.current_processing
+
+# ----------------------------
+# Load Balancer Implementations
+# ----------------------------
+class LoadBalancer:
+    def __init__(self, servers, strategy="round_robin", weights=None):
+        self.servers = servers
+        self.strategy = strategy
+        self.weights = list(weights) if weights else [1]*len(servers)
+        self.rr_idx = 0
+        # prepare weighted round robin sequence (simple expansion)
+        self.wrr_seq = []
+        if strategy == "weighted_round_robin":
+            # normalize small ints
+            for i, w in enumerate(self.weights):
+                entries = max(1, int(round(w)))
+                self.wrr_seq.extend([i]*entries)
+            if not self.wrr_seq:
+                self.wrr_seq = list(range(len(self.servers)))
+            random.shuffle(self.wrr_seq)
+        random.seed(RANDOM_SEED)
+
+    def choose_server_idx(self):
+        if self.strategy == "round_robin":
+            idx = self.rr_idx % len(self.servers)
+            self.rr_idx += 1
+            return idx
+        elif self.strategy == "least_connections":
+            # choose server with smallest queue_len (tie-break random)
+            lens = [s.queue_len() for s in self.servers]
+            min_len = min(lens)
+            candidates = [i for i, l in enumerate(lens) if l == min_len]
+            return random.choice(candidates)
+        elif self.strategy == "random":
+            return random.randrange(len(self.servers))
+        elif self.strategy == "weighted_round_robin":
+            idx = self.wrr_seq[self.rr_idx % len(self.wrr_seq)]
+            self.rr_idx += 1
+            return idx
+        else:
+            # fallback
+            return random.randrange(len(self.servers))
+
+    async def dispatch_request(self, req):
+        """Attempt to enqueue the request to chosen backend. Returns True if accepted, False if dropped."""
+        idx = self.choose_server_idx()
+        chosen = self.servers[idx]
+        # try to put without waiting; if full, drop
+        try:
+            chosen.queue.put_nowait(req)
+            metrics.server_hits[idx] += 1
+            return True
+        except asyncio.QueueFull:
+            return False
+
+# ----------------------------
+# Request generator (traffic)
+# ----------------------------
+async def request_generator(rate_per_sec, duration_sec, balancer):
+    """Generates requests for `duration_sec` seconds at approximate `rate_per_sec` arrival rate.
+       We'll approximate Poisson arrivals by sampling exponential inter-arrival times."""
+    start = time.time()
+    now = start
+    req_id = 0
+    while now - start < duration_sec:
+        # sample inter-arrival
+        if rate_per_sec <= 0:
+            await asyncio.sleep(1.0)
+            now = time.time()
+            continue
+        inter = random.expovariate(rate_per_sec)
+        await asyncio.sleep(inter)
+        now = time.time()
+        # create request object
+        req_time = now
+        req_id += 1
+        req = {
+            'id': req_id,
+            'arrival_time': req_time,
+            # on completion, callback is invoked by server with (server_id, req)
+            'complete_callback': on_request_complete
+        }
+        metrics.total_requests += 1
+        sec = int(req_time - start)
+        metrics.per_second[sec]['arrivals'] += 1
+
+        # dispatch to load balancer
+        accepted = await balancer.dispatch_request(req)
+        if not accepted:
+            metrics.dropped_requests += 1
+            metrics.per_second[sec]['dropped'] += 1
+
+    # after generating, wait for queues to drain (or let main handle stopping)
+    return
+
+# ----------------------------
+# Completion callback
+# ----------------------------
+def on_request_complete(server_id, req):
+    """Called by server when request processing finishes. Records latency & metrics."""
+    comp_time = time.time()
+    latency = comp_time - req['arrival_time']
+    metrics.completed_requests += 1
+    metrics.latencies.append(latency)
+    # per-second bucket where arrival happened
+    sec = int(req['arrival_time'] - simulation_start_time)
+    entry = metrics.per_second[sec]
+    entry['completed'] += 1
+    # update avg latency (we'll compute later)
+    # store server hits already recorded in dispatch
+
+# ----------------------------
+# Reporter task
+# ----------------------------
+async def reporter(duration, report_interval):
+    """Periodically prints a short status and collects per-second snapshots."""
+    start = simulation_start_time
+    t0 = start
+    while time.time() - start < duration:
+        await asyncio.sleep(report_interval)
+        t = time.time()
+        elapsed = t - start
+        # compute instantaneous stats
+        completed = metrics.completed_requests
+        dropped = metrics.dropped_requests
+        total = metrics.total_requests
+        lat_sample = metrics.latencies[-1000:]  # recent tail
+        recent_avg = statistics.mean(lat_sample) if lat_sample else 0.0
+        # per-server queue lengths
+        q_lengths = [s.queue_len() for s in servers]
+        print(f"[{elapsed:6.1f}s] total={total} completed={completed} dropped={dropped} recent_avg_latency={recent_avg:.3f}s queues={q_lengths}")
+    # final report printed by main
+    return
+
+# ----------------------------
+# Main simulation routine
+# ----------------------------
+async def run_simulation():
+    # start servers
+    server_tasks = []
+    for s in servers:
+        task = asyncio.create_task(s.start())
+        server_tasks.append(task)
+
+    # start request generator
+    gen_task = asyncio.create_task(request_generator(REQUEST_RATE, SIM_DURATION, balancer))
+
+    # start reporter
+    rep_task = asyncio.create_task(reporter(SIM_DURATION, REPORT_INTERVAL))
+
+    # wait for generator to finish
+    await gen_task
+
+    # wait until all queues are drained or timeout
+    drain_timeout = 10
+    drain_start = time.time()
+    while True:
+        total_queued = sum(s.queue_len() for s in servers)
+        if total_queued == 0:
+            break
+        if time.time() - drain_start > drain_timeout:
+            print("[WARN] drain timeout reached; some requests may remain in queues.")
+            break
+        await asyncio.sleep(0.5)
+
+    # stop servers
+    for s in servers:
+        s.stop()
+    # give small grace to complete in-flight items
+    await asyncio.sleep(0.5)
+    # cancel tasks
+    for t in server_tasks:
+        t.cancel()
+    await asyncio.gather(*server_tasks, return_exceptions=True)
+    await rep_task
+    return
+
+# ----------------------------
+# Utility: summary, CSV export
+# ----------------------------
+def print_summary():
+    print("\n=== Simulation Summary ===")
+    print(f"Duration               : {SIM_DURATION} s")
+    print(f"Incoming rate (avg)    : {REQUEST_RATE} req/s")
+    print(f"LB Strategy            : {LB_STRATEGY}")
+    print(f"Num servers            : {NUM_SERVERS}")
+    print(f"Service time (mean/sd) : {SERVICE_TIME_MEAN:.3f}s / {SERVICE_TIME_STD:.3f}s")
+    print()
+    print(f"Total requests arrived : {metrics.total_requests}")
+    print(f"Total completed        : {metrics.completed_requests}")
+    print(f"Total dropped          : {metrics.dropped_requests}")
+    throughput = metrics.completed_requests / SIM_DURATION if SIM_DURATION>0 else 0
+    print(f"Throughput (avg)       : {throughput:.2f} req/s")
+    if metrics.latencies:
+        print(f"Latency avg/median/p95 : {statistics.mean(metrics.latencies):.4f}s / {statistics.median(metrics.latencies):.4f}s / {percentile(metrics.latencies,95):.4f}s")
+    else:
+        print("Latency                : No completed requests")
+    print()
+    print("Per-server processed counts and final queue lens:")
+    for i, s in enumerate(servers):
+        print(f"  Server-{i} processed={s.total_processed} final_queue={s.queue_len()} hits={metrics.server_hits[i]}")
+
+    # export CSVs
+    ts = int(time.time())
+    persec_file = f"lb_persec_{LB_STRATEGY}_{ts}.csv"
+    overall_file = f"lb_overall_{LB_STRATEGY}_{ts}.csv"
+    with open(persec_file, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['second', 'arrivals', 'completed', 'dropped', 'avg_latency'])
+        for sec in range(0, SIM_DURATION+1):
+            e = metrics.per_second.get(sec, {'arrivals':0,'completed':0,'dropped':0,'avg_latency':None})
+            # compute avg latency for this second if possible
+            w.writerow([sec, e['arrivals'], e['completed'], e['dropped'], e['avg_latency']])
+    with open(overall_file, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['metric','value'])
+        w.writerow(['duration_s', SIM_DURATION])
+        w.writerow(['incoming_rate_rps', REQUEST_RATE])
+        w.writerow(['strategy', LB_STRATEGY])
+        w.writerow(['total_arrived', metrics.total_requests])
+        w.writerow(['total_completed', metrics.completed_requests])
+        w.writerow(['total_dropped', metrics.dropped_requests])
+        w.writerow(['throughput_rps', throughput])
+    print(f"\nSaved per-second CSV: {persec_file}")
+    print(f"Saved overall CSV   : {overall_file}")
+
+def percentile(data, p):
+    if not data:
+        return 0.0
+    k = max(0, min(len(data)-1, int(round((p/100.0) * (len(data)-1)))))
+    return sorted(data)[k]
+
+# ----------------------------
+# Simulation setup
+# ----------------------------
+if __name__ == "__main__":
+    # create servers
+    servers = [BackendServer(i, SERVICE_TIME_MEAN, SERVICE_TIME_STD, MAX_QUEUE_PER_SERVER) for i in range(NUM_SERVERS)]
+    # create load balancer
+    balancer = LoadBalancer(servers, strategy=LB_STRATEGY, weights=SERVER_WEIGHTS)
+
+    # track global simulation start time for bucketization
+    simulation_start_time = time.time()
+
+    try:
+        asyncio.run(run_simulation())
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+    # print summary
+    print_summary()
+
+    # short explanation for user
+    print("\nNotes:")
+    print("- Try changing LB_STRATEGY to 'round_robin', 'random', 'least_connections', 'weighted_round_robin'.")
+    print("- Increase REQUEST_RATE to exceed combined capacity (NUM_SERVERS / SERVICE_TIME_MEAN) to see drops and queueing.")
+    print("- MAX_QUEUE_PER_SERVER controls how many waiting requests a backend will tolerate; smaller queue => more drops.")
+    print("- Use the CSV output to plot time series (arrival vs completed) to visualize performance under each strategy.")
