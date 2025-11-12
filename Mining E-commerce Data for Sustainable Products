@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""
+mine_sustainable_products.py
+
+Mining E-commerce Data for Sustainable Products - single-file pipeline.
+
+Usage:
+  - Provide a CSV with at least these columns: 'id','title','description','category','price','brand'
+    Example: python mine_sustainable_products.py --input products.csv --top 30
+  - If no input is provided, the script generates a small synthetic demo dataset.
+
+Outputs:
+  - top_sustainable_products.csv
+  - cluster_summary.csv
+  - plots: top_products.png, cluster_distribution.png
+
+Author: ChatGPT (example educational script)
+"""
+
+import argparse
+import csv
+import math
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MinMaxScaler
+
+# -----------------------
+# Config / Keyword lists
+# -----------------------
+SUSTAINABILITY_KEYWORDS = {
+    "recycled": ["recycled", "recycle", "recyclable"],
+    "organic": ["organic", "organic cotton", "certified organic"],
+    "fair_trade": ["fair trade", "fairtrade"],
+    "biodegradable": ["biodegradable", "compostable"],
+    "vegan": ["vegan", "plant-based", "plant based"],
+    "cruelty_free": ["cruelty-free", "cruelty free", "not tested on animals"],
+    "energy_efficient": ["energy efficient", "energy-saving", "energy saving", "energy star"],
+    "low_plastic": ["plastic-free", "no plastic", "reduced plastic"],
+    "locally_made": ["locally made", "made locally", "made in"],
+    "upcycled": ["upcycled", "up-cycled"]
+}
+
+# Materials mapping to "good" / "bad" scores roughly
+GOOD_MATERIALS = ["bamboo", "wood", "glass", "metal", "cotton", "hemp", "linen", "ceramic"]
+BAD_MATERIALS = ["polyester", "nylon", "acrylic", "plastic", "polypropylene", "ps", "pvc"]
+
+MATERIAL_PATTERNS = GOOD_MATERIALS + BAD_MATERIALS
+
+# Words that indicate potential greenwashing or uncertain claims
+GREENWASH_WARNING = ["eco-friendly-looking", "may contain", "contains synthetic", "handmade but mass-produced"]
+
+# -----------------------
+# Utilities
+# -----------------------
+def safe_read_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    return df
+
+def normalize_text(s):
+    if pd.isna(s):
+        return ""
+    return re.sub(r'\s+', ' ', str(s).strip().lower())
+
+def detect_keywords(text: str, keyword_map: dict) -> dict:
+    found = {}
+    for key, kw_list in keyword_map.items():
+        cnt = 0
+        for kw in kw_list:
+            # word-boundary search, case insensitive
+            if re.search(r"\b" + re.escape(kw.lower()) + r"\b", text):
+                cnt += 1
+        found[key] = 1 if cnt > 0 else 0
+    return found
+
+def extract_materials(text: str):
+    found = []
+    for mat in MATERIAL_PATTERNS:
+        if re.search(r"\b" + re.escape(mat.lower()) + r"\b", text):
+            found.append(mat.lower())
+    return found
+
+def price_normalize(series: pd.Series):
+    # Min-max normalize price to 0..1, handling outliers with log transform
+    arr = series.fillna(series.median()).astype(float).values
+    # guard against zero/negative prices
+    arr2 = np.where(arr <= 0, 1.0, arr)
+    logp = np.log(arr2 + 1.0)
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(logp.reshape(-1, 1)).reshape(-1)
+    return scaled
+
+# Composite scoring: keyword hits, material score, cluster membership bonus, price factor
+def compute_eco_score(row, keyword_cols, material_list_col, price_norm, cluster_bonus=0.0):
+    # keyword hits: sum of binary flags
+    kw_sum = sum(row[c] for c in keyword_cols) if keyword_cols else 0
+    # material score: +1 per good material, -1 per bad material (cap)
+    mats = row[material_list_col]
+    mat_score = 0
+    for m in mats:
+        if m in GOOD_MATERIALS:
+            mat_score += 1
+        elif m in BAD_MATERIALS:
+            mat_score -= 1
+    # price factor: prefer lower absolute price? We normalize and invert so cheaper->higher score
+    price_factor = 1.0 - price_norm[row.name]
+    # raw score combination; weights can be tuned
+    score = (kw_sum * 1.5) + (mat_score * 1.0) + (price_factor * 1.0) + (cluster_bonus * 0.8)
+    return max(score, 0.0)
+
+# -----------------------
+# Pipeline
+# -----------------------
+def run_pipeline(df: pd.DataFrame, top_n=20, n_clusters=6, output_dir="out"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Ensure necessary columns exist
+    expected_cols = ['id', 'title', 'description', 'category', 'price', 'brand']
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = ""
+
+    # Merge textual fields
+    df['text_full'] = (df['title'].fillna('') + " " + df['description'].fillna('') + " " + df.get('category', '').fillna('') + " " + df.get('brand','').fillna(''))
+    df['text_norm'] = df['text_full'].apply(normalize_text)
+
+    # Keyword detection
+    keyword_results = df['text_norm'].apply(lambda t: detect_keywords(t, SUSTAINABILITY_KEYWORDS))
+    for k in SUSTAINABILITY_KEYWORDS.keys():
+        df[f'kw_{k}'] = keyword_results.apply(lambda d: d.get(k, 0))
+
+    keyword_cols = [f'kw_{k}' for k in SUSTAINABILITY_KEYWORDS.keys()]
+
+    # Material extraction
+    df['materials'] = df['text_norm'].apply(extract_materials)
+
+    # Greenwash warnings
+    df['greenwash_flag'] = df['text_norm'].apply(lambda t: int(any(w in t for w in GREENWASH_WARNING)))
+
+    # TF-IDF + Clustering to find clusters (to detect clusters enriched with sustainability keywords)
+    vectorizer = TfidfVectorizer(max_features=1500, stop_words='english', ngram_range=(1,2))
+    X = vectorizer.fit_transform(df['text_norm'].astype(str))
+    if df.shape[0] < n_clusters:
+        n_clusters = max(1, df.shape[0] // 2)
+    if n_clusters <= 0:
+        n_clusters = 1
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    kmeans.fit(X)
+    df['cluster'] = kmeans.labels_
+
+    # Compute cluster sustainability signal (fraction of items in cluster with any keyword)
+    cluster_stats = []
+    for c in sorted(df['cluster'].unique()):
+        cluster_df = df[df['cluster'] == c]
+        tot = len(cluster_df)
+        sustainability_hits = cluster_df[keyword_cols].sum(axis=1).astype(bool).sum()
+        frac = sustainability_hits / tot if tot > 0 else 0.0
+        cluster_stats.append({'cluster': c, 'size': tot, 'sust_fraction': frac})
+    cluster_summary = pd.DataFrame(cluster_stats).sort_values('sust_fraction', ascending=False)
+    cluster_summary.to_csv(os.path.join(output_dir, "cluster_summary.csv"), index=False)
+
+    # Price normalization
+    price_norm = price_normalize(df['price'])
+
+    # Compute per-row cluster bonus: clusters with higher sust_fraction get bonus
+    cluster_bonus_map = {row['cluster']: (row['sust_fraction']) for _, row in cluster_summary.iterrows()}
+    df['cluster_bonus'] = df['cluster'].apply(lambda c: cluster_bonus_map.get(c, 0.0))
+
+    # Compute eco_score
+    df_indexed = df.reset_index(drop=False).set_index('index')  # keep original index mapping
+    # price_norm is array aligned to df order; we need mapping row.name -> index into price_norm
+    # We'll create a map row_index -> price_norm_value
+    price_norm_map = {i: price_norm[i] for i in range(len(price_norm))}
+    df['eco_score'] = df.apply(lambda r: compute_eco_score(r, keyword_cols, 'materials', price_norm_map, cluster_bonus=r['cluster_bonus']), axis=1)
+
+    # Add a human-readable justification / tags
+    def build_justification(row):
+        tags = []
+        for k in SUSTAINABILITY_KEYWORDS.keys():
+            if row[f'kw_{k}']:
+                tags.append(k)
+        if row['materials']:
+            tags.append("materials:" + ",".join(row['materials'][:3]))
+        if row['greenwash_flag']:
+            tags.append("warning:possible_greenwash")
+        return ";".join(tags[:6]) if tags else ""
+
+    df['justification'] = df.apply(build_justification, axis=1)
+
+    # Sort and export top N
+    top_df = df.sort_values('eco_score', ascending=False).head(top_n)
+    outpath = os.path.join(output_dir, "top_sustainable_products.csv")
+    top_df_to_save = top_df[['id','title','brand','category','price','eco_score','justification','materials']]
+    top_df_to_save.to_csv(outpath, index=False)
+
+    # Export full annotated dataset
+    full_out = os.path.join(output_dir, "annotated_products.csv")
+    df.to_csv(full_out, index=False)
+
+    # Plots: Top product bar chart
+    plt.figure(figsize=(10,6))
+    labels = [ (str(i) + ": " + (t[:40] + (".." if len(t)>40 else ""))) for i,t in zip(top_df['id'], top_df['title'])]
+    scores = top_df['eco_score']
+    y_pos = np.arange(len(labels))
+    plt.barh(y_pos[::-1], scores[::-1])
+    plt.yticks(y_pos, labels)
+    plt.xlabel("Eco Score (higher = more sustainable)")
+    plt.title("Top {} Sustainable Products (estimated)".format(top_n))
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "top_products.png"))
+    plt.close()
+
+    # Cluster distribution plot
+    plt.figure(figsize=(8,5))
+    cluster_sizes = df['cluster'].value_counts().sort_index()
+    plt.bar(cluster_sizes.index.astype(str), cluster_sizes.values)
+    plt.xlabel("Cluster")
+    plt.ylabel("Number of products")
+    plt.title("Cluster distribution")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "cluster_distribution.png"))
+    plt.close()
+
+    print(f"[done] outputs written to {output_dir}:")
+    print(f"  - Top products: {outpath}")
+    print(f"  - Annotated full dataset: {full_out}")
+    print(f"  - Cluster summary: {os.path.join(output_dir,'cluster_summary.csv')}")
+    print(f"  - Plots: top_products.png, cluster_distribution.png")
+
+    return df, top_df, cluster_summary
+
+# -----------------------
+# Demo dataset generator
+# -----------------------
+def generate_demo_data(n=200):
+    """Create synthetic dataset with some sustainable and unsustainable examples"""
+    titles = []
+    descriptions = []
+    categories = []
+    brands = []
+    prices = []
+    ids = []
+    rng = np.random.RandomState(42)
+
+    sustainable_phrases = [
+        "made from recycled glass",
+        "organic cotton",
+        "fair trade certified",
+        "biodegradable packaging",
+        "bamboo fiber",
+        "upcycled leather",
+        "energy efficient",
+        "plastic-free packaging",
+        "compostable",
+    ]
+    non_sustainable_phrases = [
+        "100% polyester",
+        "contains plastic",
+        "cheap synthetic fabric",
+        "non-recyclable packaging",
+        "mass-produced",
+        "disposable",
+    ]
+    base_titles = ["Tote Bag", "Water Bottle", "T-Shirt", "LED Bulb", "Coffee Mug", "Sneakers", "Backpack", "Yoga Mat"]
+    base_brands = ["GreenCo", "Everyday", "FastGear", "HomePlus", "EcoLife", "BudgetBuy", "PremiumWear"]
+    cats = ["apparel", "home", "electronics", "accessories", "fitness"]
+
+    for i in range(n):
+        ids.append(f"P{i+1:05d}")
+        t = rng.choice(base_titles)
+        brands.append(rng.choice(base_brands))
+        categories.append(rng.choice(cats))
+        price = float(round(rng.uniform(5.0, 200.0), 2))
+        prices.append(price)
+        # Compose description with a chance to include sustainability phrase or not
+        if rng.rand() < 0.35:
+            # sustainable
+            desc = f"{t} - {rng.choice(sustainable_phrases)}. Ethically sourced and low-impact manufacturing."
+            # occasionally mix materials
+            if rng.rand() < 0.4:
+                desc += " Material: " + rng.choice(["bamboo", "organic cotton", "glass", "metal"])
+        else:
+            desc = f"{t} - {rng.choice(non_sustainable_phrases)}. Low price, mass-produced."
+            if rng.rand() < 0.4:
+                desc += " Material: " + rng.choice(["polyester", "nylon", "plastic"])
+        # small flavor
+        if rng.rand() < 0.2:
+            desc += " Comes in recyclable packaging."
+        titles.append(t + " " + str(i))
+        descriptions.append(desc)
+
+    df = pd.DataFrame({
+        'id': ids,
+        'title': titles,
+        'description': descriptions,
+        'category': categories,
+        'price': prices,
+        'brand': brands
+    })
+    return df
+
+# -----------------------
+# CLI
+# -----------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Mine e-commerce data for sustainable products (single-file).")
+    p.add_argument('--input', help="CSV file path with product data (id,title,description,category,price,brand)", default=None)
+    p.add_argument('--top', type=int, default=20, help="How many top products to export/plot")
+    p.add_argument('--clusters', type=int, default=6, help="Number of clusters for TF-IDF+KMeans")
+    p.add_argument('--out', default="out", help="Output directory")
+    p.add_argument('--demo', action='store_true', help="Force demo synthetic dataset")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+
+    if args.input and not args.demo:
+        if not os.path.exists(args.input):
+            print(f"[error] input file not found: {args.input}")
+            sys.exit(1)
+        print(f"[info] reading input CSV: {args.input}")
+        df = safe_read_csv(args.input)
+    else:
+        print("[info] generating demo dataset (no input provided or --demo used)")
+        df = generate_demo_data(300)
+
+    annotated, top_df, cluster_summary = run_pipeline(df, top_n=args.top, n_clusters=args.clusters, output_dir=args.out)
+
+    # Print quick table of top results to console
+    display_cols = ['id','title','brand','category','price','eco_score','justification']
+    print("\nTop products (console preview):")
+    print(top_df[display_cols].to_string(index=False, max_colwidth=40))
+
+if __name__ == "__main__":
+    main()
