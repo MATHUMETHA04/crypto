@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+asm_codegen.py
+
+Tiny Code Generator -> x86-64 assembly (GAS, Intel syntax).
+
+Usage:
+    python3 asm_codegen.py input.txt output.s
+
+Then build:
+    gcc -no-pie output.s -o output
+
+Run:
+    ./output
+
+Language supported (example):
+    a = 5
+    b = a + 3
+    c = b * 2
+    if c > 10 goto L1
+    print c
+    goto END
+    L1:
+    print b
+    END:
+    return
+
+Notes:
+ - All values are treated as 64-bit signed integers.
+ - Very small educational generator; not optimized.
+ - Output assembly calls printf; link with libc using gcc as shown.
+"""
+
+import sys
+import re
+from typing import List, Tuple, Dict
+
+# --------------------------
+# Lexer / Parser (line based)
+# --------------------------
+ASSIGN_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*=\s*(.+)$')
+IF_GOTO_RE = re.compile(r'^\s*if\s+(.+?)\s+goto\s+([A-Za-z_]\w*)\s*$', re.IGNORECASE)
+GOTO_RE = re.compile(r'^\s*goto\s+([A-Za-z_]\w*)\s*$', re.IGNORECASE)
+LABEL_RE = re.compile(r'^\s*([A-Za-z_]\w*):\s*$')
+PRINT_RE = re.compile(r'^\s*print\s+(.+)\s*$', re.IGNORECASE)
+RETURN_RE = re.compile(r'^\s*return\s*$', re.IGNORECASE)
+EXPR_BINOP_RE = re.compile(r'^\s*(\S+)\s*([\+\-\*/])\s*(\S+)\s*$')
+EXPR_COMP_RE = re.compile(r'^\s*(\S+)\s*(<=|>=|==|!=|<|>)\s*(\S+)\s*$')
+CONST_RE = re.compile(r'^-?\d+$')
+VAR_RE = re.compile(r'^[A-Za-z_]\w*$')
+
+# --------------------------
+# Helpers
+# --------------------------
+def is_const(tok: str) -> bool:
+    return bool(CONST_RE.match(tok))
+
+def is_var(tok: str) -> bool:
+    return bool(VAR_RE.match(tok))
+
+def sanitize_label(lbl: str) -> str:
+    return lbl
+
+# --------------------------
+# CodeGen state
+# --------------------------
+class CodeGen:
+    def __init__(self):
+        self.lines: List[str] = []         # emitted assembly lines
+        self.var_offsets: Dict[str,int] = {}  # var -> offset from rbp (positive number)
+        self.next_stack_offset = 8         # bytes; we allocate 8 bytes per var
+        self.labels_declared = set()       # label names declared
+        self.used_labels = set()           # labels referenced (gotos)
+        self.data_lines: List[str] = []    # .data section lines
+        self.format_label = "fmt_int"
+        # allocate space for format string in .data
+        self.data_lines.append(f'{self.format_label}: .asciz "%ld\\n"')
+
+    def alloc_var(self, name: str):
+        if name not in self.var_offsets:
+            offset = self.next_stack_offset
+            self.var_offsets[name] = offset
+            self.next_stack_offset += 8
+
+    def emit(self, s: str):
+        self.lines.append(s)
+
+    def emit_data(self, s: str):
+        self.data_lines.append(s)
+
+    def get_var_offset(self, name: str) -> int:
+        return self.var_offsets[name]
+
+    def finalize(self):
+        # Build final assembly text combining data and code with prologue and epilogue at main
+        text = []
+        # data
+        text.append(".intel_syntax noprefix")
+        text.append(".data")
+        text.extend(self.data_lines)
+        text.append(".text")
+        text.append(".global main")
+        # prologue
+        text.append("main:")
+        text.append("    push rbp")
+        text.append("    mov rbp, rsp")
+        # allocate stack frame: round up to 16 for ABI (keep space for locals)
+        total_local = self.next_stack_offset
+        # ensure 16-byte alignment
+        align = (16 - (total_local % 16)) % 16
+        alloc = total_local + align
+        if alloc > 0:
+            text.append(f"    sub rsp, {alloc}    # allocate locals ({total_local} bytes + {align} align)")
+        # append generated code body
+        text.extend(self.lines)
+        # default return 0 if no explicit return emitted
+        text.append("L_EXIT:")
+        text.append("    mov rax, 0")
+        # epilogue
+        if alloc > 0:
+            text.append(f"    add rsp, {alloc}")
+        text.append("    pop rbp")
+        text.append("    ret")
+        return "\n".join(text)
+
+# --------------------------
+# Small expression codegen
+# --------------------------
+# We'll use rax/rdx/rsi/rdi/rcx as temporaries following SysV calling regs.
+# For evaluating an operand (var or const), we'll load it into rax.
+# After computing, result is left in rax.
+#
+# Memory layout:
+# variable x stored at [rbp - offset] where offset is as allocated.
+
+def load_operand_to_rax(gen: CodeGen, tok: str):
+    """Emit instructions to load tok (var or const) into rax."""
+    if is_const(tok):
+        gen.emit(f"    mov rax, {tok}")
+    elif is_var(tok):
+        gen.alloc_var(tok)
+        off = gen.get_var_offset(tok)
+        gen.emit(f"    mov rax, QWORD PTR [rbp - {off}]")
+    else:
+        raise ValueError(f"Invalid token in load: {tok}")
+
+def store_rax_to_var(gen: CodeGen, varname: str):
+    gen.alloc_var(varname)
+    off = gen.get_var_offset(varname)
+    gen.emit(f"    mov QWORD PTR [rbp - {off}], rax")
+
+def emit_binary_op(gen: CodeGen, dst: str, left: str, op: str, right: str):
+    # load left into rax
+    load_operand_to_rax(gen, left)
+    # load right into rbx (use rbx as scratch; must preserve rbx if needed - we're not calling C code between)
+    # to be safe, use rcx as second (caller-saved)
+    if is_const(right):
+        if op == '+':
+            gen.emit(f"    add rax, {right}")
+        elif op == '-':
+            gen.emit(f"    sub rax, {right}")
+        elif op == '*':
+            # multiplication: imul rax, imm64
+            gen.emit(f"    imul rax, {right}")
+        elif op == '/':
+            # rax = left, perform signed division by imm -> move imm to rcx then div
+            gen.emit(f"    mov rdx, 0")
+            # sign-extend rax into rdx:rax
+            gen.emit("    cqo")
+            gen.emit(f"    mov rcx, {right}")
+            gen.emit("    idiv rcx")
+        else:
+            raise ValueError("Unknown op")
+    else:
+        # right is variable: load to rcx
+        gen.emit(f"    mov rcx, 0")  # clear rcx (not necessary but clean)
+        load_right = []
+        if is_var(right):
+            gen.alloc_var(right)
+            off = gen.get_var_offset(right)
+            gen.emit(f"    mov rcx, QWORD PTR [rbp - {off}]")
+        else:
+            # fallback
+            gen.emit(f"    mov rcx, {right}")
+        if op == '+':
+            gen.emit("    add rax, rcx")
+        elif op == '-':
+            gen.emit("    sub rax, rcx")
+        elif op == '*':
+            gen.emit("    imul rax, rcx")
+        elif op == '/':
+            # signed division: dividend in rax, sign-extend into rdx, divisor in rcx, idiv rcx
+            gen.emit("    cqo")
+            gen.emit("    idiv rcx")
+        else:
+            raise ValueError("Unknown op")
+    # store result
+    store_rax_to_var(gen, dst)
+
+def emit_assign_const(gen: CodeGen, varname: str, const_val: str):
+    gen.alloc_var(varname)
+    gen.emit(f"    mov rax, {const_val}")
+    store_rax_to_var(gen, varname)
+
+def emit_assign_var(gen: CodeGen, varname: str, src: str):
+    gen.alloc_var(src)
+    gen.alloc_var(varname)
+    off = gen.get_var_offset(src)
+    gen.emit(f"    mov rax, QWORD PTR [rbp - {off}]")
+    store_rax_to_var(gen, varname)
+
+def emit_print_var(gen: CodeGen, tok: str):
+    # ensure variable exists if var
+    if is_var(tok):
+        gen.alloc_var(tok)
+        off = gen.get_var_offset(tok)
+        # load into rsi (2nd arg for printf)
+        gen.emit(f"    mov rsi, QWORD PTR [rbp - {off}]")
+    elif is_const(tok):
+        gen.emit(f"    mov rsi, {tok}")
+    else:
+        raise ValueError("Invalid print arg")
+    # address of format string to rdi
+    gen.emit(f"    lea rdi, DWORD PTR [{gen.format_label}]")
+    gen.emit("    xor eax, eax    # printf varargs: set AL=0 for SSE")
+    gen.emit("    call printf")
+
+def emit_conditional_jump(gen: CodeGen, left: str, comp: str, right: str, label: str):
+    # evaluate left into rax, right into rcx, perform cmp rax, rcx and emit jump
+    load_operand_to_rax(gen, left)
+    # load right to rcx
+    if is_const(right):
+        gen.emit(f"    mov rcx, {right}")
+    else:
+        gen.alloc_var(right)
+        off = gen.get_var_offset(right)
+        gen.emit(f"    mov rcx, QWORD PTR [rbp - {off}]")
+    gen.emit("    cmp rax, rcx")
+    jmp_map = {
+        '<': 'jl',
+        '<=': 'jle',
+        '>': 'jg',
+        '>=': 'jge',
+        '==': 'je',
+        '!=': 'jne'
+    }
+    if comp not in jmp_map:
+        raise ValueError(f"Unknown comparator: {comp}")
+    jmp_instr = jmp_map[comp]
+    gen.used_labels.add(label)
+    gen.emit(f"    {jmp_instr} {sanitize_label(label)}")
+
+# --------------------------
+# Line handler
+# --------------------------
+def handle_line(gen: CodeGen, line: str, lineno:int):
+    # strip comments
+    line = line.split('#',1)[0].strip()
+    if not line:
+        return
+    # label
+    m = LABEL_RE.match(line)
+    if m:
+        lbl = sanitize_label(m.group(1))
+        gen.labels_declared.add(lbl)
+        gen.emit(f"{lbl}:")
+        return
+    # return
+    if RETURN_RE.match(line):
+        gen.emit("    jmp L_EXIT")
+        return
+    # print
+    m = PRINT_RE.match(line)
+    if m:
+        expr = m.group(1).strip()
+        # simple expression allowed: var or const
+        if EXPR_BINOP_RE.match(expr) or EXPR_COMP_RE.match(expr):
+            raise ValueError(f"print of expressions not supported on line {lineno}: {line}")
+        emit_print_var(gen, expr)
+        return
+    # if goto
+    m = IF_GOTO_RE.match(line)
+    if m:
+        cond = m.group(1).strip()
+        lbl = sanitize_label(m.group(2))
+        # parse condition: left comp right
+        m2 = EXPR_COMP_RE.match(cond)
+        if not m2:
+            raise ValueError(f"Invalid condition on line {lineno}: {line}")
+        left, comp, right = m2.group(1), m2.group(2), m2.group(3)
+        emit_conditional_jump(gen, left, comp, right, lbl)
+        return
+    # goto
+    m = GOTO_RE.match(line)
+    if m:
+        lbl = sanitize_label(m.group(1))
+        gen.used_labels.add(lbl)
+        gen.emit(f"    jmp {lbl}")
+        return
+    # assignment
+    m = ASSIGN_RE.match(line)
+    if m:
+        varname = m.group(1)
+        rhs = m.group(2).strip()
+        # binary op?
+        m2 = EXPR_BINOP_RE.match(rhs)
+        if m2:
+            left, op, right = m2.group(1), m2.group(2), m2.group(3)
+            # support constants or vars
+            emit_binary_op(gen, varname, left, op, right)
+            return
+        # simple var or const assign
+        if is_const(rhs):
+            emit_assign_const(gen, varname, rhs)
+            return
+        if is_var(rhs):
+            emit_assign_var(gen, varname, rhs)
+            return
+        raise ValueError(f"Unrecognized assignment RHS on line {lineno}: {line}")
+
+    # unknown line
+    raise ValueError(f"Syntax error on line {lineno}: {line}")
+
+# --------------------------
+# Top-level compile function
+# --------------------------
+def compile_lines(lines: List[str]) -> str:
+    gen = CodeGen()
+    for i, raw in enumerate(lines, start=1):
+        try:
+            handle_line(gen, raw, i)
+        except Exception as e:
+            print(f"Error processing line {i}: {raw.strip()}")
+            raise
+    # check labels usage vs declaration; declare missing labels as empty
+    for lbl in gen.used_labels:
+        if lbl not in gen.labels_declared:
+            # create a label that jumps to exit (safety)
+            gen.emit(f"{lbl}:")
+    return gen.finalize()
+
+# --------------------------
+# CLI
+# --------------------------
+def main(argv):
+    if len(argv) < 3:
+        print("Usage: python3 asm_codegen.py input.txt output.s")
+        print("Example input language (save as input.txt):")
+        print("""
+a = 5
+b = a + 3
+c = b * 2
+if c > 10 goto L1
+print c
+goto END
+L1:
+print b
+END:
+return
+""")
+        sys.exit(1)
+
+    infile = argv[1]
+    outfile = argv[2]
+    with open(infile, 'r') as f:
+        src_lines = f.readlines()
+    asm_text = compile_lines(src_lines)
+    with open(outfile, 'w') as f:
+        f.write(asm_text)
+    print(f"Assembly written to {outfile}")
+    print("Assemble & link with: gcc -no-pie {out} -o outprog".format(out=outfile))
+    print("Then run ./outprog")
+
+if __name__ == "__main__":
+    main(sys.argv)
