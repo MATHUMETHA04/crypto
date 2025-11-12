@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+micro_platform.py
+
+Single-file demo: Cloud-Native Microservices Platform with Service Discovery.
+
+Components:
+ - Discovery server (FastAPI) on port 8000
+ - Gateway / API proxy (FastAPI) on port 8080 that queries discovery and proxies to service instances
+ - Example microservices ("users" and "orders") - multiple instances spawned as subprocesses (multiprocessing)
+ - Instances auto-register and send heartbeats (TTL) to the discovery server
+ - Simple round-robin routing per service
+
+Usage:
+    python micro_platform.py
+
+Dependencies:
+    pip install fastapi uvicorn httpx
+"""
+
+import asyncio
+import multiprocessing
+import os
+import signal
+import socket
+import sys
+import time
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+import uvicorn
+
+# --------------------------
+# Configuration
+# --------------------------
+DISCOVERY_HOST = "127.0.0.1"
+DISCOVERY_PORT = 8000
+
+GATEWAY_HOST = "127.0.0.1"
+GATEWAY_PORT = 8080
+
+# Example microservices and how many instances to spawn (for demo)
+SERVICES_TO_SPAWN = {
+    "users": 2,
+    "orders": 2,
+}
+
+# base starting port for services (we'll increment per instance)
+SERVICE_BASE_PORT = 9000
+
+# TTL (seconds) for registrations; instances must heartbeat faster than TTL
+REGISTRATION_TTL = 8.0
+HEARTBEAT_INTERVAL = 3.0
+
+# Discovery prune interval
+PRUNE_INTERVAL = 2.0
+
+# Gateway discovery refresh interval
+GATEWAY_REFRESH = 2.0
+
+# --------------------------
+# Discovery Server
+# --------------------------
+# In-memory registry structure:
+# {
+#   "service_name": {
+#       "instance_id": ServiceInstance(...)
+#   }
+# }
+@dataclass
+class ServiceInstance:
+    instance_id: str
+    service: str
+    host: str
+    port: int
+    meta: dict
+    last_seen: float
+    ttl: float
+
+    def address(self):
+        return f"http://{self.host}:{self.port}"
+
+    def to_dict(self):
+        d = asdict(self)
+        d['address'] = self.address()
+        return d
+
+
+def run_discovery_server():
+    app = FastAPI(title="Service Discovery (Demo)")
+
+    registry: Dict[str, Dict[str, ServiceInstance]] = defaultdict(dict)
+    registry_lock = asyncio.Lock()
+
+    @app.on_event("startup")
+    async def discovery_startup():
+        async def pruner():
+            while True:
+                await asyncio.sleep(PRUNE_INTERVAL)
+                now = time.time()
+                async with registry_lock:
+                    removed = []
+                    for svc, instances in list(registry.items()):
+                        for iid, inst in list(instances.items()):
+                            if inst.last_seen + inst.ttl < now:
+                                del instances[iid]
+                                removed.append((svc, iid))
+                        if not instances:
+                            del registry[svc]
+                    if removed:
+                        print(f"[discovery] pruned expired instances: {removed}")
+        asyncio.create_task(pruner())
+
+    @app.post("/register")
+    async def register(payload: dict):
+        """
+        Expected JSON:
+        {
+            "service": "users",
+            "instance_id": "uuid",
+            "host": "127.0.0.1",
+            "port": 9001,
+            "ttl": 10.0,
+            "meta": {...}
+        }
+        """
+        required = {"service", "instance_id", "host", "port"}
+        if not required.issubset(payload.keys()):
+            raise HTTPException(status_code=400, detail=f"Missing fields {required - set(payload.keys())}")
+        svc = payload["service"]
+        iid = payload["instance_id"]
+        host = payload["host"]
+        port = int(payload["port"])
+        ttl = float(payload.get("ttl", REGISTRATION_TTL))
+        meta = payload.get("meta", {})
+
+        inst = ServiceInstance(instance_id=iid, service=svc, host=host, port=port, meta=meta, last_seen=time.time(), ttl=ttl)
+        async with registry_lock:
+            registry[svc][iid] = inst
+        print(f"[discovery] registered {svc}/{iid} -> {inst.address()} ttl={ttl}")
+        return {"status": "ok"}
+
+    @app.post("/heartbeat")
+    async def heartbeat(payload: dict):
+        """
+        payload: {"service":"users","instance_id":"..."}
+        """
+        svc = payload.get("service")
+        iid = payload.get("instance_id")
+        if not svc or not iid:
+            raise HTTPException(status_code=400, detail="service and instance_id required")
+        async with registry_lock:
+            instances = registry.get(svc, {})
+            inst = instances.get(iid)
+            if not inst:
+                raise HTTPException(status_code=404, detail="instance not registered")
+            inst.last_seen = time.time()
+        # lightweight response
+        return {"status": "ok"}
+
+    @app.post("/deregister")
+    async def deregister(payload: dict):
+        svc = payload.get("service")
+        iid = payload.get("instance_id")
+        if not svc or not iid:
+            raise HTTPException(status_code=400, detail="service and instance_id required")
+        async with registry_lock:
+            instances = registry.get(svc, {})
+            if iid in instances:
+                del instances[iid]
+                if not instances:
+                    del registry[svc]
+                print(f"[discovery] deregistered {svc}/{iid}")
+                return {"status": "ok"}
+        raise HTTPException(status_code=404, detail="instance not found")
+
+    @app.get("/registry")
+    async def get_registry():
+        async with registry_lock:
+            snapshot = {svc: {iid: inst.to_dict() for iid, inst in insts.items()} for svc, insts in registry.items()}
+        return JSONResponse(content=snapshot)
+
+    @app.get("/services")
+    async def list_services():
+        async with registry_lock:
+            services = list(registry.keys())
+        return {"services": services}
+
+    @app.get("/services/{service_name}")
+    async def get_service_instances(service_name: str):
+        async with registry_lock:
+            insts = registry.get(service_name, {})
+            out = [inst.to_dict() for inst in insts.values()]
+        return {"instances": out}
+
+    # Simple health endpoint for discovery
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "time": time.time()}
+
+    print(f"[discovery] starting on {DISCOVERY_HOST}:{DISCOVERY_PORT}")
+    uvicorn.run(app, host=DISCOVERY_HOST, port=DISCOVERY_PORT, log_level="info")
+
+
+# --------------------------
+# Gateway / API Proxy
+# --------------------------
+def run_gateway():
+    app = FastAPI(title="Gateway (Demo)")
+
+    # local cached view of services: service -> deque(list_of_instances)
+    # we'll store list of dicts with keys: instance_id, address, last_seen, meta
+    service_cache: Dict[str, List[dict]] = {}
+    cache_lock = asyncio.Lock()
+
+    async def refresh_cache_periodically():
+        client = httpx.AsyncClient(timeout=5.0)
+        while True:
+            try:
+                r = await client.get(f"http://{DISCOVERY_HOST}:{DISCOVERY_PORT}/registry")
+                r.raise_for_status()
+                data = r.json()
+                async with cache_lock:
+                    service_cache.clear()
+                    for svc, insts in data.items():
+                        # insts: {iid: instdict}
+                        # convert to list
+                        lst = []
+                        for iid, inst in insts.items():
+                            lst.append({"instance_id": iid, "address": inst["address"], "meta": inst.get("meta", {})})
+                        service_cache[svc] = lst
+                #print(f"[gateway] refreshed cache: { {k: len(v) for k,v in service_cache.items()} }")
+            except Exception as e:
+                print(f"[gateway] failed refresh: {e}")
+            await asyncio.sleep(GATEWAY_REFRESH)
+
+    @app.on_event("startup")
+    async def gateway_startup():
+        asyncio.create_task(refresh_cache_periodically())
+
+    # very small per-service counters for round-robin
+    rr_counters: Dict[str, int] = defaultdict(int)
+
+    async def choose_instance(service: str) -> Optional[dict]:
+        async with cache_lock:
+            lst = service_cache.get(service, [])
+            if not lst:
+                return None
+            idx = rr_counters[service] % len(lst)
+            rr_counters[service] += 1
+            return lst[idx]
+
+    @app.api_route("/api/{service}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+    async def proxy(service: str, path: str, request: Request):
+        """
+        Proxy incoming request to one of the service instances returned by discovery.
+        Basic round-robin load balancing.
+        """
+        inst = await choose_instance(service)
+        if not inst:
+            raise HTTPException(status_code=503, detail=f"service '{service}' not available")
+        target = f"{inst['address']}/{path}"
+        method = request.method
+        headers = dict(request.headers)
+        # remove host to avoid conflicts
+        headers.pop("host", None)
+        body = await request.body()
+        params = dict(request.query_params)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                resp = await client.request(method, target, headers=headers, content=body, params=params)
+            except httpx.RequestError as e:
+                # mark instance might be unhealthy; attempt a second instance
+                print(f"[gateway] request error to {target}: {e}")
+                # try another instance if available
+                async with cache_lock:
+                    lst = [i for i in service_cache.get(service, []) if i['instance_id'] != inst['instance_id']]
+                if lst:
+                    alt = lst[0]
+                    try:
+                        resp = await client.request(method, f"{alt['address']}/{path}", headers=headers, content=body, params=params)
+                    except Exception as e2:
+                        raise HTTPException(status_code=502, detail=str(e2))
+                else:
+                    raise HTTPException(status_code=502, detail=str(e))
+            # return response content and status
+            content = resp.content
+            return JSONResponse(content=resp.json() if resp.headers.get("content-type","").startswith("application/json") else content.decode(errors="ignore"), status_code=resp.status_code)
+
+    @app.get("/gateway/services")
+    async def gateway_services():
+        async with cache_lock:
+            snapshot = {svc: [{"instance_id": i["instance_id"], "address": i["address"]} for i in insts] for svc, insts in service_cache.items()}
+        return snapshot
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    print(f"[gateway] starting on {GATEWAY_HOST}:{GATEWAY_PORT}")
+    uvicorn.run(app, host=GATEWAY_HOST, port=GATEWAY_PORT, log_level="info")
+
+
+# --------------------------
+# Example Microservice App
+# --------------------------
+def make_microservice_app(service_name: str, port: int):
+    app = FastAPI(title=f"microservice:{service_name}:{port}")
+
+    @app.get("/hello")
+    async def hello():
+        # return which instance served the request
+        return {"service": service_name, "port": port, "msg": f"hello from {service_name}:{port}"}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "service": service_name, "port": port}
+
+    # demo endpoint that echoes path and query
+    @app.api_route("/{rest_of_path:path}", methods=["GET","POST","PUT","DELETE","PATCH"])
+    async def catch_all(rest_of_path: str, request: Request):
+        body = await request.body()
+        return {
+            "service": service_name,
+            "port": port,
+            "path": rest_of_path,
+            "method": request.method,
+            "query": dict(request.query_params),
+            "body": body.decode(errors="ignore")
+        }
+
+    return app
+
+
+def run_service_instance(service_name: str, port: int):
+    """
+    Each service instance will register with discovery and periodically heartbeat.
+    Runs a FastAPI app via uvicorn in-process.
+    """
+    instance_id = f"{service_name}-{uuid.uuid4().hex[:8]}"
+    host = "127.0.0.1"
+    app = make_microservice_app(service_name, port)
+
+    async def register_and_heartbeat_loop():
+        async with httpx.AsyncClient() as client:
+            # register
+            try:
+                await client.post(f"http://{DISCOVERY_HOST}:{DISCOVERY_PORT}/register", json={
+                    "service": service_name,
+                    "instance_id": instance_id,
+                    "host": host,
+                    "port": port,
+                    "ttl": REGISTRATION_TTL,
+                    "meta": {"pid": os.getpid()}
+                }, timeout=5.0)
+                print(f"[{service_name}:{port}] registered as {instance_id}")
+            except Exception as e:
+                print(f"[{service_name}:{port}] registration failed: {e}")
+            # heartbeat loop
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                try:
+                    await client.post(f"http://{DISCOVERY_HOST}:{DISCOVERY_PORT}/heartbeat", json={
+                        "service": service_name,
+                        "instance_id": instance_id
+                    }, timeout=5.0)
+                    #print(f"[{service_name}:{port}] heartbeat ok")
+                except Exception as e:
+                    print(f"[{service_name}:{port}] heartbeat failed: {e}")
+
+    # Run uvicorn server and heartbeat concurrently
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+
+    async def main_async():
+        # start heartbeat task shortly after server starts
+        asyncio.create_task(register_and_heartbeat_loop())
+        await server.serve()
+
+    # catch signals to deregister before exit
+    def _signal_handler(sig, frame):
+        # best-effort deregister
+        try:
+            httpx.post(f"http://{DISCOVERY_HOST}:{DISCOVERY_PORT}/deregister", json={
+                "service": service_name,
+                "instance_id": instance_id
+            }, timeout=1.0)
+            print(f"[{service_name}:{port}] deregistered on signal")
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+    asyncio.run(main_async())
+
+
+# --------------------------
+# Orchestration: spawn discovery, gateway, and service instances
+# --------------------------
+def spawn_process(target, *args):
+    p = multiprocessing.Process(target=target, args=args, daemon=True)
+    p.start()
+    return p
+
+
+def main():
+    # Spawn discovery server
+    disc_proc = spawn_process(run_discovery_server)
+    # give discovery a sec to fully boot before services register
+    time.sleep(1.0)
+
+    # Spawn gateway
+    gw_proc = spawn_process(run_gateway)
+    time.sleep(1.0)
+
+    # Spawn services (instances)
+    service_procs = []
+    next_port = SERVICE_BASE_PORT
+    for svc, count in SERVICES_TO_SPAWN.items():
+        for i in range(count):
+            port = next_port
+            next_port += 1
+            p = spawn_process(run_service_instance, svc, port)
+            service_procs.append(p)
+            time.sleep(0.2)
+
+    print("\n=== Demo started ===")
+    print(f"- Discovery: http://{DISCOVERY_HOST}:{DISCOVERY_PORT}/registry")
+    print(f"- Gateway:   http://{GATEWAY_HOST}:{GATEWAY_PORT}/api/{{service}}/{{path}}")
+    print("Example:")
+    print(f"  curl http://{GATEWAY_HOST}:{GATEWAY_PORT}/api/users/hello")
+    print(f"  curl http://{GATEWAY_HOST}:{GATEWAY_PORT}/api/orders/hello")
+    print("\nPress Ctrl+C to stop everything.\n")
+
+    # Wait for processes; handle Ctrl+C to terminate cleanly
+    try:
+        while True:
+            time.sleep(1.0)
+            # check child processes liveness
+            if not disc_proc.is_alive():
+                print("[main] discovery process exited unexpectedly, shutting down.")
+                break
+            if not gw_proc.is_alive():
+                print("[main] gateway process exited unexpectedly, shutting down.")
+                break
+    except KeyboardInterrupt:
+        print("\n[main] shutdown requested, terminating child processes...")
+    finally:
+        for p in service_procs + [gw_proc, disc_proc]:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        for p in service_procs + [gw_proc, disc_proc]:
+            p.join(timeout=1.0)
+        print("[main] all stopped. bye.")
+
+
+if __name__ == "__main__":
+    main()
