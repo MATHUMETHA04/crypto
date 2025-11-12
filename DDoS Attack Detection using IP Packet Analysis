@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+ddos_detector.py
+
+DDoS Attack Detection using IP Packet Analysis (single-file).
+Supports live capture (interface) or offline pcap analysis.
+
+Features:
+ - Per-source packet rate detection (packets/sec)
+ - SYN-flood detection (high SYN rate from single source)
+ - ICMP flood detection
+ - Port scan detection (many unique destination ports)
+ - Sliding window using deques for efficient time-based counts
+ - Log alerts to stdout and CSV file
+
+Dependencies:
+ - scapy (pip install scapy)
+ - Python 3.8+
+
+Usage:
+  sudo python3 ddos_detector.py --iface eth0
+  python3 ddos_detector.py --pcap sample.pcap --window 10 --pps-threshold 200
+"""
+
+import argparse
+import csv
+import time
+import threading
+import signal
+from collections import defaultdict, deque
+from datetime import datetime
+from scapy.all import sniff, rdpcap, IP, TCP, UDP, ICMP  # scapy
+
+# -------------------------
+# Configurable defaults
+# -------------------------
+DEFAULT_WINDOW = 10  # seconds sliding window
+CHECK_INTERVAL = 1   # seconds between checks
+DEFAULT_PPS_THRESHOLD = 200      # packets/sec from single IP -> suspicious (adjust)
+DEFAULT_SYN_THRESHOLD = 100      # SYN packets/sec -> suspicious
+DEFAULT_ICMP_THRESHOLD = 200     # ICMP packets/sec -> suspicious
+DEFAULT_UNIQUE_PORTS_THRESHOLD = 50  # unique dest ports in window -> port-scan
+ALERT_LOG_CSV = "ddos_alerts.csv"
+
+# -------------------------
+# Global structures
+# -------------------------
+shutdown_event = threading.Event()
+
+# Store timestamps for each source IP (for packet rate)
+packets_by_src = defaultdict(lambda: deque())  # src_ip -> deque([timestamps])
+syn_by_src = defaultdict(lambda: deque())      # src_ip -> deque([timestamps]) for SYN packets
+icmp_by_src = defaultdict(lambda: deque())     # src_ip -> deque([timestamps]) for ICMP
+ports_by_src = defaultdict(lambda: defaultdict(lambda: deque()))  # src -> dst_port -> deque([timestamps])
+
+# Overall protocol counters in window (optional)
+protocol_counts = defaultdict(lambda: deque())  # proto_name -> deque([timestamps])
+
+
+# Lock for concurrency
+data_lock = threading.Lock()
+
+
+# -------------------------
+# Packet processing
+# -------------------------
+def process_packet(pkt, now=None):
+    """
+    Called for every packet captured.
+    Records timestamps in the deques for sliding-window analysis.
+    """
+    if now is None:
+        now = time.time()
+    if not pkt.haslayer(IP):
+        return
+
+    src = pkt[IP].src
+    dst = pkt[IP].dst
+    ts = now
+
+    with data_lock:
+        # record generic packet
+        packets_by_src[src].append(ts)
+        protocol_counts['total'].append(ts)
+
+        # TCP specifics
+        if pkt.haslayer(TCP):
+            tcp = pkt[TCP]
+            flags = tcp.flags
+            # record SYN packets (SYN set and ACK not set typically)
+            if flags & 0x02:  # SYN bit
+                syn_by_src[src].append(ts)
+                protocol_counts['tcp_syn'].append(ts)
+            # track destination port usage for port-scan detection
+            dport = int(tcp.dport)
+            ports_by_src[src][dport].append(ts)
+            protocol_counts['tcp'].append(ts)
+
+        # UDP specifics
+        elif pkt.haslayer(UDP):
+            udp = pkt[UDP]
+            dport = int(udp.dport)
+            ports_by_src[src][dport].append(ts)
+            protocol_counts['udp'].append(ts)
+
+        # ICMP specifics
+        if pkt.haslayer(ICMP):
+            icmp_by_src[src].append(ts)
+            protocol_counts['icmp'].append(ts)
+
+
+# -------------------------
+# Sliding window cleanup and checks
+# -------------------------
+def cleanup_deque(dq, cutoff):
+    """Pop left while older than cutoff (timestamp)."""
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+
+def check_thresholds(window=DEFAULT_WINDOW,
+                     pps_threshold=DEFAULT_PPS_THRESHOLD,
+                     syn_threshold=DEFAULT_SYN_THRESHOLD,
+                     icmp_threshold=DEFAULT_ICMP_THRESHOLD,
+                     unique_ports_threshold=DEFAULT_UNIQUE_PORTS_THRESHOLD):
+    """
+    Periodically (every CHECK_INTERVAL) checks all tracked IPs and produces alerts
+    when thresholds are exceeded.
+    """
+    with open(ALERT_LOG_CSV, 'a', newline='') as csvfile:
+        csvwriter = csv.writer(csvfile)
+        # if file empty, write header
+        if csvfile.tell() == 0:
+            csvwriter.writerow(['timestamp', 'src_ip', 'alert_type', 'value', 'window_seconds', 'details'])
+
+        while not shutdown_event.is_set():
+            now = time.time()
+            cutoff = now - window
+            alerts = []
+
+            with data_lock:
+                # Clean global protocol counts
+                for proto, dq in list(protocol_counts.items()):
+                    cleanup_deque(dq, cutoff)
+
+                # For each source IP
+                for src, dq in list(packets_by_src.items()):
+                    # purge old timestamps
+                    cleanup_deque(dq, cutoff)
+                    pkt_count = len(dq)
+                    pps = pkt_count / window
+
+                    if pps >= pps_threshold:
+                        alerts.append((src, 'high_pps', pps, f'packets_in_window={pkt_count}'))
+
+                    # SYN checks
+                    syn_dq = syn_by_src.get(src, deque())
+                    cleanup_deque(syn_dq, cutoff)
+                    syn_count = len(syn_dq)
+                    syn_rate = syn_count / window
+                    if syn_rate >= syn_threshold:
+                        alerts.append((src, 'syn_flood', syn_rate, f'syns_in_window={syn_count}'))
+
+                    # ICMP checks
+                    icmp_dq = icmp_by_src.get(src, deque())
+                    cleanup_deque(icmp_dq, cutoff)
+                    icmp_count = len(icmp_dq)
+                    icmp_rate = icmp_count / window
+                    if icmp_rate >= icmp_threshold:
+                        alerts.append((src, 'icmp_flood', icmp_rate, f'icmps_in_window={icmp_count}'))
+
+                    # Port-scan / many unique ports
+                    ports_map = ports_by_src.get(src, {})
+                    # purge old per-port timestamps and count unique active ports
+                    active_ports = 0
+                    total_port_hits = 0
+                    for port, pdq in list(ports_map.items()):
+                        cleanup_deque(pdq, cutoff)
+                        if not pdq:
+                            # remove empty deques to free memory
+                            del ports_map[port]
+                            continue
+                        active_ports += 1
+                        total_port_hits += len(pdq)
+
+                    if active_ports >= unique_ports_threshold:
+                        alerts.append((src, 'port_scan', active_ports,
+                                       f'unique_ports={active_ports}, total_port_hits={total_port_hits}'))
+
+                # Optional: detect distributed (many sources) events by counting distinct srcs with high pps
+                # Could be extended here.
+
+            # emit alerts
+            for src, a_type, val, details in alerts:
+                ts_iso = datetime.utcnow().isoformat() + 'Z'
+                msg = f"[{ts_iso}] ALERT: {a_type} from {src} value={val:.2f} details={details}"
+                print(msg)
+                csvwriter.writerow([ts_iso, src, a_type, f"{val:.2f}", window, details])
+                csvfile.flush()
+
+            time.sleep(CHECK_INTERVAL)
+
+
+# -------------------------
+# Capture drivers
+# -------------------------
+def live_capture(iface, bpf_filter=None):
+    """Start sniffing live packets on interface using scapy.sniff"""
+    print(f"[INFO] Starting live capture on interface '{iface}'. Press Ctrl+C to stop.")
+    try:
+        sniff(iface=iface, prn=process_packet, store=0, filter=bpf_filter)
+    except PermissionError:
+        print("[ERROR] Permission denied: live capture likely requires root privileges. Run with sudo.")
+    except Exception as e:
+        print(f"[ERROR] live sniff failed: {e}")
+
+
+def pcap_capture(pcap_file):
+    """Process packets from a pcap file (non-blocking)."""
+    print(f"[INFO] Reading pcap file: {pcap_file}")
+    try:
+        packets = rdpcap(pcap_file)
+    except FileNotFoundError:
+        print(f"[ERROR] File not found: {pcap_file}")
+        return
+    except Exception as e:
+        print(f"[ERROR] Failed to read pcap: {e}")
+        return
+
+    print(f"[INFO] Processing {len(packets)} packets from pcap...")
+    start = time.time()
+    for pkt in packets:
+        # use packet time if present else wall clock
+        pkt_time = getattr(pkt, 'time', None) or time.time()
+        process_packet(pkt, now=pkt_time)
+    print(f"[INFO] Finished processing pcap in {time.time()-start:.2f}s")
+
+
+# -------------------------
+# Graceful shutdown
+# -------------------------
+def signal_handler(sig, frame):
+    print("\n[INFO] Shutdown signal received. Stopping detector...")
+    shutdown_event.set()
+
+
+# -------------------------
+# CLI and main
+# -------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="DDoS detection using IP packet analysis (single-file).")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument('--iface', help='Network interface to sniff (live). Example: eth0')
+    group.add_argument('--pcap', help='Path to pcap file to analyze')
+    p.add_argument('--window', type=int, default=DEFAULT_WINDOW, help='Sliding window in seconds')
+    p.add_argument('--pps-threshold', type=int, default=DEFAULT_PPS_THRESHOLD,
+                   help='Packets per second threshold per source')
+    p.add_argument('--syn-threshold', type=int, default=DEFAULT_SYN_THRESHOLD,
+                   help='SYNs per second threshold per source')
+    p.add_argument('--icmp-threshold', type=int, default=DEFAULT_ICMP_THRESHOLD,
+                   help='ICMP packets per second threshold per source')
+    p.add_argument('--ports-threshold', type=int, default=DEFAULT_UNIQUE_PORTS_THRESHOLD,
+                   help='Unique destination ports threshold per source (port-scan)')
+    p.add_argument('--bpf', default=None, help='Optional BPF filter for live capture (e.g., "tcp")')
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Start background checker thread
+    checker = threading.Thread(target=check_thresholds, kwargs={
+        'window': args.window,
+        'pps_threshold': args.pps_threshold,
+        'syn_threshold': args.syn_threshold,
+        'icmp_threshold': args.icmp_threshold,
+        'unique_ports_threshold': args.ports_threshold
+    }, daemon=True)
+    checker.start()
+
+    try:
+        if args.pcap:
+            pcap_capture(args.pcap)
+            # after pcap processed, give checker a moment to evaluate and then exit
+            time.sleep(args.window + 1)
+            shutdown_event.set()
+        else:
+            # live capture (blocking)
+            live_capture(args.iface, bpf_filter=args.bpf)
+            # sniff will exit on exception or ctrl-c; set shutdown
+            shutdown_event.set()
+
+    finally:
+        print("[INFO] Waiting for background checker to finish...")
+        checker.join(timeout=3)
+        print("[INFO] Exiting.")
+
+
+if __name__ == '__main__':
+    main()
